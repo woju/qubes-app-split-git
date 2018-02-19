@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+
+#
+# git remote add qrexec://<vm>/<path>[?keyring=<trustedkeys.kpx>[&keyring=...]]
+#   <path>
+#   - does not contain '/'
+#   - means /home/user/QubesGit/<path>
+#   - is possibly a symlink somewhere else
+#   - is an qrexec argument for policy purposes (git.List, git.Fetch)
+#
+#   keyring= may specify additional trusted keyrings; this is passed directly
+#   to gpgv as --keyring; see gpgv(1)
+
+import argparse
+import asyncio
+import asyncio.streams
+import functools
+import hashlib
+import logging
+import os
+import pathlib
+import string
+import subprocess
+import sys
+import urllib.parse
+import zlib
+
+MAX_BUFFER_SIZE = 65536
+ALLOWED_IN_OBJECT_ID = set(string.hexdigits.encode('ascii'))
+ALLOWED_IN_TAG_NAME = set(
+    (string.ascii_letters + string.digits + '.-_').encode('ascii'))
+
+CAPABILITIES = [
+    'fetch',
+    'option',
+]
+
+BEGIN_PGP_SIGNATURE = b'-----BEGIN PGP SIGNATURE-----'
+
+parser = argparse.ArgumentParser()
+parser.add_argument('repository')
+parser.add_argument('url')
+
+class GitObject:
+    # pylint: disable=too-few-public-methods
+    def __init__(self, objectid, *, untrusted_data):
+        assert objectid == hashlib.sha1(untrusted_data).hexdigest()
+        self.objectid = objectid
+        self._data = untrusted_data
+        del untrusted_data
+
+        untrusted_header, untrusted_content = self._data.split(b'\0', 1)
+        untrusted_header = untrusted_header.decode('ascii')
+        untrusted_type, untrusted_size = untrusted_header.split(' ')
+        del untrusted_header
+
+        assert untrusted_size.isdigit()
+        untrusted_size = int(untrusted_size)
+        assert len(untrusted_content) == untrusted_size
+        del untrusted_size
+
+        assert untrusted_type in ('tag', 'commit', 'tree', 'blob')
+        self.type = untrusted_type
+        del untrusted_type
+
+        self.content = untrusted_content
+        del untrusted_content
+
+        if self.type in ('tag', 'commit'):
+            header, _ = self.content.rstrip(b'\n').split(b'\n\n', 1)
+            header = header.decode()
+            self._bag = dict(line.split(' ', 1) for line in header.split('\n'))
+
+    def __getitem__(self, *args, **kwds):
+        return self._bag.__getitem__(*args, **kwds)
+
+    def write_to(self, remote):
+        dirpath = remote.git_dir / 'objects' / self.objectid[:2]
+        os.makedirs(str(dirpath), exist_ok=True)
+        with open(str(dirpath / self.objectid[2:]), 'wb') as file:
+            file.write(zlib.compress(self._data))
+
+
+async def stdio(*, loop=None):
+    # loosely based on https://gist.github.com/nathan-hoad/8966377
+    if loop is None:
+        loop = asyncio.get_event_loop()
+
+    reader = asyncio.StreamReader()
+    await loop.connect_read_pipe(
+        functools.partial(asyncio.StreamReaderProtocol, reader), sys.stdin)
+
+    os.set_blocking(sys.stdout.fileno(), False)
+
+    writer = asyncio.StreamWriter(*(await loop.connect_write_pipe(
+        asyncio.streams.FlowControlMixin, sys.stdout)), None, loop)
+
+    return reader, writer
+
+class Remote:
+    def __init__(self, name, url):
+        self.name = name
+
+        url = urllib.parse.urlsplit(url)
+        assert url.scheme == 'qrexec'
+        assert not url.fragment
+
+        query = {} if not url.query else urllib.parse.parse_qs(url.query,
+            strict_parsing=True, errors='strict')
+        if 'keyring' in query:
+            self._keyrings = query.pop('keyring')
+        else:
+            self._keyrings = ()
+        assert not query
+
+        self.vmname = url.netloc
+        self.path = url.path.lstrip('/')
+        assert '/' not in self.path
+
+        self.git_dir = pathlib.Path(os.environ['GIT_DIR'])
+
+    def list(self):
+        ret = []
+        untrusted_data = self._qrexec('git.List')
+        for untrusted_line in untrusted_data.rstrip(b'\n').split(b'\n'):
+            untrusted_commitid, untrusted_tagid, untrusted_tag = (
+                untrusted_line.split(b' '))
+
+            commitid = self._verify_objid(untrusted_objid=untrusted_commitid)
+            tagid = self._verify_objid(untrusted_objid=untrusted_tagid)
+
+            assert not set(untrusted_tag) - ALLOWED_IN_TAG_NAME
+            tag = untrusted_tag
+            del untrusted_tag
+
+            # refuse temptation to yield: first check all lines, then return
+            ret.append([commitid.decode(), tagid.decode(), tag.decode()])
+
+        return ret
+
+    def fetch(self, objid, refname):
+        assert refname.startswith('refs/tags/')
+        tagname = refname[10:]
+
+        untrusted_tag = self._qrexec_fetch(objid)
+        self.verify_tag(untrusted_tag=untrusted_tag)
+
+        assert untrusted_tag['tag'] == tagname
+        assert untrusted_tag['type'] == 'commit'
+
+        tag = untrusted_tag
+        del untrusted_tag
+
+        tag.write_to(self)
+
+        commit = self._qrexec_fetch_and_write(tag['object'])
+
+        treeid = commit['tree']
+        self._qrexec_fetch_and_write(treeid)
+        return self._fetch_recursive(treeid)
+
+    def _qrexec(self, rpcname, input=None):
+        # pylint: disable=redefined-builtin
+        # TODO timeout
+        proc = subprocess.Popen(['/usr/bin/qrexec-client-vm', self.vmname,
+                '+'.join((rpcname, self.path))],
+            stdin=(subprocess.PIPE if input is not None else None),
+            stdout=subprocess.PIPE)
+        if input is not None:
+            proc.stdin.write(input)
+            proc.stdin.close()
+        data = proc.stdout.read(MAX_BUFFER_SIZE)
+        proc.stdout.close()
+        proc.wait()
+        assert proc.returncode == 0
+        return data
+
+    def _qrexec_fetch(self, objectid):
+        return GitObject(objectid, untrusted_data=self._qrexec('git.Fetch',
+            input=objectid.encode('ascii')))
+
+    def _qrexec_fetch_and_write(self, *args, **kwds):
+        obj = self._qrexec_fetch(*args, **kwds)
+        obj.write_to(self)
+        return obj
+
+    def _fetch_recursive(self, treeid):
+        logging.debug('_fetch_recursive(%r)', treeid)
+        for line in subprocess.check_output(['git', 'ls-tree', treeid]
+                ).decode().rstrip('\n').split('\n'):
+            _, objtype, objid, *_ = line.split()
+            logging.debug('objtype %s objid %s', objtype, objid)
+            self._qrexec_fetch_and_write(objid)
+            if objtype == 'tree':
+                self._fetch_recursive(objid)
+
+    def verify_tag(self, untrusted_tag):
+        untrusted_data = untrusted_tag.content
+        assert BEGIN_PGP_SIGNATURE in untrusted_data
+        index = untrusted_data.index(BEGIN_PGP_SIGNATURE)
+        untrusted_signature = untrusted_data[index:]
+        untrusted_tag = untrusted_data[:index]
+        del untrusted_data
+
+        sig_read, sig_write = os.pipe()
+        tag_read, tag_write = os.pipe()
+
+        proc = subprocess.Popen(['gpgv', '--enable-special-filenames',
+#               '--quiet',
+                *('--keyring={}'.format(keyring) for keyring in self._keyrings),
+                '--', '-&{}'.format(sig_read), '-&{}'.format(tag_read)],
+            pass_fds=(sig_read, tag_read),
+#           stderr=subprocess.DEVNULL,
+            )
+
+        os.close(sig_read)
+        os.close(tag_read)
+
+        with open(sig_write, 'wb') as file:
+            file.write(untrusted_signature)
+        with open(tag_write, 'wb') as file:
+            file.write(untrusted_tag)
+        del untrusted_signature
+
+        proc.wait()
+        assert proc.returncode == 0
+
+        tag = untrusted_tag
+        del untrusted_tag
+        return tag
+
+    @staticmethod
+    def _verify_objid(untrusted_objid):
+        assert len(untrusted_objid) == 40
+        assert not set(untrusted_objid) - ALLOWED_IN_OBJECT_ID
+        objid = untrusted_objid
+        del untrusted_objid
+        return objid
+
+
+async def main(args=None):
+    logging.basicConfig(
+#       format='%(asctime)s %(name)s %(message)s',
+        format='%(asctime)s %(message)s',
+        level=logging.WARNING)
+
+    args = parser.parse_args(args)
+    remote = Remote(args.repository, args.url)
+    logging.debug('remote name %s vmname %s', remote.name, remote.vmname)
+
+    # TODO actually use this
+    followtags = False
+
+    stdin, stdout = await stdio()
+
+    async def out(*args):
+        logging.debug('→ %s', ' '.join(map(str, args)))
+        stdout.write(' '.join(args).encode() + b'\n')
+        await stdout.drain()
+
+    while not stdin.at_eof():
+        line = (await stdin.readline()).decode().strip()
+        logging.debug('← %s', line)
+
+        if line == 'capabilities':
+            for cap in CAPABILITIES:
+                await out(cap)
+            await out()
+            continue
+
+        if line.startswith('list'):
+            for commitid, tagid, tag in remote.list():
+                await out('{} refs/tags/{}'.format(tagid, tag))
+                await out('{} refs/tags/{}^{{}}'.format(commitid, tag))
+
+            await out()
+            continue
+
+        if line.startswith('fetch'):
+            while line:
+                _, objectid, ref = line.split()
+                logging.debug('objectid %r ref %r', objectid, ref)
+                remote.fetch(objectid, ref)
+                line = (await stdin.readline()).decode().strip()
+
+            await out()
+            continue
+
+        if line.startswith('option'):
+            _, option, args = line.split(' ', 2)
+
+            if option == 'followtags':
+                followtags = (args.lower() == 'true')
+                await out('ok')
+                continue
+
+            await out('unsupported')
+            continue
+
+    logging.debug('loop ended; sys.stdin.readable')
+
+if __name__ == '__main__':
+    asyncio.get_event_loop().run_until_complete(main())
+
+# vim: ts=4 sts=4 sw=4 et

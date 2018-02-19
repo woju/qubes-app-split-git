@@ -1,0 +1,7 @@
+#!/bin/sh
+
+read objid
+cd "$HOME"/QubesGit/"${QREXEC_SERVICE_ARGUMENT}"
+type="$(git cat-file -t "$objid")"
+printf '%s %s\0' "$type" "$(git cat-file -s "$objid")"
+exec git cat-file "$type" "$objid"

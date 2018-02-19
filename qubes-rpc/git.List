@@ -1,0 +1,4 @@
+#!/bin/sh
+
+exec git -C "$HOME"/QubesGit/"${QREXEC_SERVICE_ARGUMENT}" \
+	for-each-ref --format='%(object) %(objectname) %(refname:strip=2)' refs/tags/*
