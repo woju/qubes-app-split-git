@@ -1,19 +1,43 @@
 #!/usr/bin/env python3
 
 #
-# git remote add qrexec://<vm>/<path>[?keyring=<trustedkeys.kpx>[&keyring=...]]
+# split git for Qubes OS
+# Copyright (C) 2018  Wojtek Porczyk <woju@invisiblethingslab.com>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+
+#
+# git remote add qrexec://<vm>/<path>[?keyring=<trustedkeys.kpx>[&keyring=...]][&list_head_only=0]
 #   <path>
 #   - does not contain '/'
 #   - means /home/user/QubesGit/<path>
 #   - is possibly a symlink somewhere else
-#   - is an qrexec argument for policy purposes (git.List, git.Fetch)
+#   - is an qrexec argument for policy purposes (git.List[HeadOnly], git.Fetch)
 #
 #   keyring= may specify additional trusted keyrings; this is passed directly
 #   to gpgv as --keyring; see gpgv(1)
+#
+#   list_head_only= if true (the default) means that only the latest tag is
+#   listed; set to something false to list all tags
+#
 
 import argparse
 import asyncio
 import asyncio.streams
+import configparser
 import functools
 import hashlib
 import logging
@@ -107,10 +131,17 @@ class Remote:
 
         query = {} if not url.query else urllib.parse.parse_qs(url.query,
             strict_parsing=True, errors='strict')
-        if 'keyring' in query:
-            self._keyrings = query.pop('keyring')
+
+        self._keyrings = query.pop('keyring') if 'keyring' in query else ()
+
+        try:
+            list_head_only = query.pop('list_head_only')
+        except KeyError:
+            self._list_head_only = True
         else:
-            self._keyrings = ()
+            self._list_head_only = configparser.ConfigParser.BOOLEAN_STATES[
+                list_head_only[-1].casefold()]
+
         assert not query
 
         self.vmname = url.netloc
@@ -121,7 +152,8 @@ class Remote:
 
     def list(self):
         ret = []
-        untrusted_data = self._qrexec('git.List')
+        untrusted_data = self._qrexec(
+            'git.ListHeadOnly' if self._list_head_only else 'git.List')
         for untrusted_line in untrusted_data.rstrip(b'\n').split(b'\n'):
             untrusted_commitid, untrusted_tagid, untrusted_tag = (
                 untrusted_line.split(b' '))

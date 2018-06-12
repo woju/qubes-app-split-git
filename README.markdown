@@ -11,7 +11,7 @@ identifier.
 To use this, define remote using `qrexec://` protocol.
 
 ```
-git remote add <remote> qrexec://<qube>/<directory>[?keyring=<keyring>]
+git remote add <remote> qrexec://<qube>/<directory>[?keyring=<keyring>][&list_head_only=0]
 ```
 
 - `<qube>` is a name of the remote qube
@@ -20,6 +20,8 @@ git remote add <remote> qrexec://<qube>/<directory>[?keyring=<keyring>]
 - `<keyring>` is optional path to keyring which holds trusted public keys; if
   relative, it should be under `$HOME/.gnupg`, but just use
   `gpg --no-default-keyring --keyring <keyring> --import` and you'll be fine
+- list_head_only= if true (the default) means that only the latest tag is
+  listed; set to something false to list all tags
 
 After defining it, you can list it and fetch individual tags.
 

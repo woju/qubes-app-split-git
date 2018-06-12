@@ -1,7 +1,5 @@
-#!/bin/sh
-
 #
-# split git for Qubes OS
+# The Qubes OS Project, https://www.qubes-os.org/
 # Copyright (C) 2018  Wojtek Porczyk <woju@invisiblethingslab.com>
 #
 # This program is free software; you can redistribute it and/or modify
@@ -19,14 +17,38 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 #
 
-set -e
+Name:       qubes-split-git
+Version:    @VERSION@
+Release:    1%{dist}
+Summary:    Secure git import over qrexec
 
-FORMATOPT=--format='%(object) %(objectname) %(refname:strip=2)'
-cd "$HOME"/QubesGit/"${QREXEC_SERVICE_ARGUMENT}"
+Group:      Qubes
+Vendor:     Invisible Things Lab
+License:    GPL
+URL:        https://www.qubes-os.org/
 
-if test "$(basename "$0")" = git.ListHeadOnly
-then
-    exec git tag --points-at HEAD "$FORMATOPT"
-else
-    exec git for-each-ref "$FORMATOPT" refs/tags/*
-fi
+Requires:   python3
+Requires:   git
+
+Source0: %{name}-%{version}.tar.gz
+
+%description
+This package is intended for fetching signed tags from other qubes via qrexec.
+Only correctly signed tags are ever written to disk.
+
+%prep
+%setup -q
+
+%build
+%install
+make install \
+    DESTDIR=$RPM_BUILD_ROOT
+
+%files
+/etc/qubes-rpc/git.Fetch
+/etc/qubes-rpc/git.List
+/etc/qubes-rpc/git.ListHeadOnly
+/usr/bin/git-remote-qrexec
+
+%changelog
+@CHANGELOG@
