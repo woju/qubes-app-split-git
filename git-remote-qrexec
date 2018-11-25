@@ -49,10 +49,12 @@ import sys
 import urllib.parse
 import zlib
 
-MAX_BUFFER_SIZE = 65536
+MAX_BUFFER_SIZE = 10000000  # 10 MB
 ALLOWED_IN_OBJECT_ID = set(string.hexdigits.encode('ascii'))
 ALLOWED_IN_TAG_NAME = set(
     (string.ascii_letters + string.digits + '.-_').encode('ascii'))
+
+TIMEOUT = 5  # in seconds, for single qrexec call
 
 CAPABILITIES = [
     'fetch',
@@ -104,7 +106,6 @@ class GitObject:
         with open(str(dirpath / self.objectid[2:]), 'wb') as file:
             file.write(zlib.compress(self._data))
 
-
 async def stdio(*, loop=None):
     # loosely based on https://gist.github.com/nathan-hoad/8966377
     if loop is None:
@@ -120,6 +121,113 @@ async def stdio(*, loop=None):
         asyncio.streams.FlowControlMixin, sys.stdout)), None, loop)
 
     return reader, writer
+
+class AbstractTagVerifier:
+    def __init__(self, keyrings):
+        self.keyrings = keyrings
+
+    async def verify_tag(self, untrusted_tag):
+        logging.debug('verify_tag')
+        untrusted_data = untrusted_tag.content
+        assert BEGIN_PGP_SIGNATURE in untrusted_data
+        index = untrusted_data.index(BEGIN_PGP_SIGNATURE)
+        untrusted_signature = untrusted_data[index:]
+        untrusted_tag = untrusted_data[:index]
+        del untrusted_data
+
+        proc, sigfile, tagfile = await self.gpgv()
+
+        # NOTE: open()ing and write()ing has to be done concurrently for both
+        # pipes, because we don't know how remote end is coordinated. For
+        # os.pipe() this is not relevant, but os.mkfifo() case is tricky:
+        # open(2) for writing end returns only after reading end has been
+        # opened.
+        sigwriter, tagwriter = await asyncio.gather(
+            self.open_and_write_to_fd(sigfile, untrusted_signature),
+            self.open_and_write_to_fd(tagfile, untrusted_tag))
+        del untrusted_signature
+
+        self.cleanup()
+        await proc.wait()
+        assert proc.returncode == 0
+
+        tag = untrusted_tag
+        del untrusted_tag
+        return tag
+
+    def get_common_gpgv_args(self):
+#       yield '--quiet',
+        for keyring in self.keyrings:
+            yield '--keyring={}'.format(keyring)
+
+    async def open_and_write_to_fd(self, file, input, *, loop=None):
+        # pylint: disable=redefined-builtin
+        if loop is None:
+            loop = asyncio.get_event_loop()
+        fd = await loop.run_in_executor(None, open, file, 'wb')
+        writer = asyncio.StreamWriter(*(await loop.connect_write_pipe(
+                asyncio.streams.FlowControlMixin, fd)), None, loop)
+        writer.write(input)
+        await writer.drain()
+        writer.close()
+
+    @classmethod
+    def select_tag_verifier(cls, *args, **kwds):
+        if pathlib.Path('/usr/bin/gpgv2').is_file():
+            cls = LegacyTagVerifier
+        return cls(*args, **kwds)
+
+    # the following methods can be overloaded:
+
+    async def gpgv(self, *, untrusted_sig, untrusted_tag):
+        raise NotImplementedError()
+
+    def cleanup(self):
+        pass
+
+
+class TagVerifier(AbstractTagVerifier):
+    async def gpgv(self, *, untrusted_sig, untrusted_tag):
+        sig_read, sig_write = os.pipe()
+        tag_read, tag_write = os.pipe()
+
+        proc = await asyncio.create_subprocess_exec('gpgv',
+            *self.get_common_gpgv_args(),
+            '--enable-special-filenames',
+            '--', '-&{}'.format(sig_read), '-&{}'.format(tag_read),
+            pass_fds=(sig_read, tag_read),
+#           stderr=subprocess.DEVNULL,
+        )
+        os.close(sig_read)
+        os.close(tag_read)
+
+        return proc, sig_write, tag_write
+
+class LegacyTagVerifier(AbstractTagVerifier):
+    # fc25, old gpgv without --enable-special-filenames
+    async def gpgv(self):
+        prefix = '/tmp/splitgit-{}-'.format(os.getpid())
+        self.sigfifo = prefix + 'sig'
+        self.tagfifo = prefix + 'tag'
+
+        os.mkfifo(self.sigfifo)
+        os.mkfifo(self.tagfifo)
+
+        proc = await asyncio.create_subprocess_exec('gpgv',
+                *self.get_common_gpgv_args(),
+                '--', self.sigfifo, self.tagfifo,
+                stdin=None,
+                stdout=None,
+                stderr=None,
+            )
+
+        return proc, self.sigfifo, self.tagfifo
+
+    def cleanup(self):
+        super().cleanup()
+        os.unlink(self.sigfifo)
+        os.unlink(self.tagfifo)
+
 
 class Remote:
     def __init__(self, name, url):
@@ -149,10 +257,11 @@ class Remote:
         assert '/' not in self.path
 
         self.git_dir = pathlib.Path(os.environ['GIT_DIR'])
+        self._objects_seen = set()
 
-    def list(self):
+    async def list(self):
         ret = []
-        untrusted_data = self._qrexec(
+        untrusted_data = await self._qrexec(
             'git.ListHeadOnly' if self._list_head_only else 'git.List')
         for untrusted_line in untrusted_data.rstrip(b'\n').split(b'\n'):
             untrusted_commitid, untrusted_tagid, untrusted_tag = (
@@ -170,12 +279,12 @@ class Remote:
 
         return ret
 
-    def fetch(self, objid, refname):
+    async def fetch(self, objid, refname):
         assert refname.startswith('refs/tags/')
         tagname = refname[10:]
 
-        untrusted_tag = self._qrexec_fetch(objid)
-        self.verify_tag(untrusted_tag=untrusted_tag)
+        untrusted_tag = await self._qrexec_fetch(objid)
+        await self.verify_tag(untrusted_tag=untrusted_tag)
 
         assert untrusted_tag['tag'] == tagname
         assert untrusted_tag['type'] == 'commit'
@@ -184,82 +293,133 @@ class Remote:
         del untrusted_tag
 
         tag.write_to(self)
+        await self._fetch_recursive(tag['object'], type=tag['type'])
+        return tag
 
-        commit = self._qrexec_fetch_and_write(tag['object'])
+    @staticmethod
+    async def _readn_until_eof(stream, n, iden='<unknown>'):
+        # stream.read(n) where n > 0 does not read until EOF, but just one
+        # chunk, therefore we need this...
 
-        treeid = commit['tree']
-        self._qrexec_fetch_and_write(treeid)
-        return self._fetch_recursive(treeid)
+        logging.debug('_readn(%r, %r, iden=%r)', stream, n, iden)
+        try:
+            await stream.readexactly(n + 1)
+        except asyncio.IncompleteReadError as e:
+            return e.partial
+        else:
+            logging.critical('remote sent too big file for %s', iden)
+            sys.exit(1)
 
-    def _qrexec(self, rpcname, input=None):
+    async def _qrexec(self, rpcname, input=None):
         # pylint: disable=redefined-builtin
         # TODO timeout
-        proc = subprocess.Popen(['/usr/bin/qrexec-client-vm', self.vmname,
-                '+'.join((rpcname, self.path))],
-            stdin=(subprocess.PIPE if input is not None else None),
-            stdout=subprocess.PIPE)
+        rpcfull = '{}+{}'.format(rpcname, self.path)
+        if pathlib.Path('/usr/bin/qrexec-client-vm').is_file():
+            args = ('/usr/bin/qrexec-client-vm', self.vmname, rpcfull)
+        elif pathlib.Path('/usr/bin/qrexec-client').is_file():
+            args = ('/usr/bin/qrexec-client', '-d', self.vmname,
+                'DEFAULT:QUBESRPC {} dom0'.format(rpcfull))
+
+        proc = await asyncio.create_subprocess_exec(*args,
+            stdin=(subprocess.PIPE
+                if input is not None else subprocess.DEVNULL),
+            stdout=subprocess.PIPE,
+            stderr=None)
+
         if input is not None:
             proc.stdin.write(input)
             proc.stdin.close()
-        data = proc.stdout.read(MAX_BUFFER_SIZE)
-        proc.stdout.close()
-        proc.wait()
-        assert proc.returncode == 0
-        return data
-
-    def _qrexec_fetch(self, objectid):
-        return GitObject(objectid, untrusted_data=self._qrexec('git.Fetch',
-            input=objectid.encode('ascii')))
-
-    def _qrexec_fetch_and_write(self, *args, **kwds):
-        obj = self._qrexec_fetch(*args, **kwds)
-        obj.write_to(self)
-        return obj
-
-    def _fetch_recursive(self, treeid):
-        logging.debug('_fetch_recursive(%r)', treeid)
-        for line in subprocess.check_output(['git', 'ls-tree', treeid]
-                ).decode().rstrip('\n').split('\n'):
-            _, objtype, objid, *_ = line.split()
-            logging.debug('objtype %s objid %s', objtype, objid)
-            self._qrexec_fetch_and_write(objid)
-            if objtype == 'tree':
-                self._fetch_recursive(objid)
-
-    def verify_tag(self, untrusted_tag):
-        untrusted_data = untrusted_tag.content
-        assert BEGIN_PGP_SIGNATURE in untrusted_data
-        index = untrusted_data.index(BEGIN_PGP_SIGNATURE)
-        untrusted_signature = untrusted_data[index:]
-        untrusted_tag = untrusted_data[:index]
-        del untrusted_data
-
-        sig_read, sig_write = os.pipe()
-        tag_read, tag_write = os.pipe()
-
-        proc = subprocess.Popen(['gpgv', '--enable-special-filenames',
-#               '--quiet',
-                *('--keyring={}'.format(keyring) for keyring in self._keyrings),
-                '--', '-&{}'.format(sig_read), '-&{}'.format(tag_read)],
-            pass_fds=(sig_read, tag_read),
-#           stderr=subprocess.DEVNULL,
-            )
-
-        os.close(sig_read)
-        os.close(tag_read)
-
-        with open(sig_write, 'wb') as file:
-            file.write(untrusted_signature)
-        with open(tag_write, 'wb') as file:
-            file.write(untrusted_tag)
-        del untrusted_signature
-
-        proc.wait()
+        stdout = await asyncio.wait_for(
+            self._readn_until_eof(proc.stdout, MAX_BUFFER_SIZE,
+                iden='{} input={!r}'.format(rpcfull, input)),
+            timeout=TIMEOUT)
+        await proc.wait()
         assert proc.returncode == 0
 
-        tag = untrusted_tag
-        del untrusted_tag
-        return tag
+        return stdout
+
+    async def _qrexec_fetch(self, objectid):
+        return GitObject(objectid, untrusted_data=(
+            await self._qrexec('git.Fetch', input=objectid.encode('ascii'))))
+
+    @staticmethod
+    async def _subprocess_check_output(*args, input=None,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwds):
+        proc = await asyncio.create_subprocess_exec(*args, stdout=stdout,
+                stderr=stderr, **kwds)
+        stdout, stderr = await proc.communicate(input)
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, args,
+                    output=stdout, stderr=stderr)
+#       logging.debug('_subprocess_check_output(%s) → %d (%r, %r)',
+#           ', '.join(repr(arg) for arg in args),
+#           proc.returncode, stdout, stderr)
+        return stdout
+
+    async def _fetch_recursive(self, objectid, *, type=None):
+        # pylint: disable=redefined-builtin
+        logging.debug('_fetch_recursive(%r)', objectid)
+
+        if objectid in self._objects_seen:
+            logging.debug('  object %s already seen, skipping', objectid)
+            return
+
+        # check if we already have this object
+        try:
+            if type is None:
+                type = (await self._subprocess_check_output(
+                    'git', 'cat-file', '-t', objectid)).decode().strip()
+            content = await self._subprocess_check_output(
+                'git', 'cat-file', type, objectid)
+
+            logging.debug('  loaded existing object %s', objectid)
+            untrusted_data = (
+                '{} {}'.format(type, len(content)).encode() + b'\0' + content)
+            obj = GitObject(objectid, untrusted_data=untrusted_data)
+
+        # nope, let's fetch it
+        except subprocess.CalledProcessError:
+            obj = await self._qrexec_fetch(objectid)
+            if type is not None:
+                assert obj.type == type
+            obj.write_to(self)
+
+        self._objects_seen.add(objectid)
+
+        if obj.type == 'commit':
+            await self._fetch_recursive(obj['tree'])
+            try:
+                parent = obj['parent']
+            except KeyError:
+                pass
+            else:
+                await self._fetch_recursive(parent, type='commit')
+            return
+
+        if obj.type == 'tree':
+            for line in (await self._subprocess_check_output(
+                        'git', 'ls-tree', objectid)
+                    ).decode().rstrip('\n').split('\n'):
+                _, objtype, objid, *args = line.split()
+
+                logging.debug('objtype %s objid %s', objtype, objid)
+                assert objtype in ('blob', 'tree', 'commit'), \
+                    'unsupported object type in tree:' + objtype
+
+                if objtype == 'commit':
+                    # TODO submodules
+                    logging.warning('submodules are unsupported!'
+                        ' found submodule %s with commit %s', args[0], objid)
+                    continue
+
+                await self._fetch_recursive(objid, type=objtype)
+
+            return
+
+
+    async def verify_tag(self, untrusted_tag):
+        tag_verifier = TagVerifier.select_tag_verifier(keyrings=self._keyrings)
+        return await tag_verifier.verify_tag(untrusted_tag)
 
     @staticmethod
     def _verify_objid(untrusted_objid):
@@ -271,10 +431,12 @@ class Remote:
 
 
 async def main(args=None):
+    # for debugging, set level to NOTSET, this also disables 'option verbosity'
     logging.basicConfig(
-#       format='%(asctime)s %(name)s %(message)s',
-        format='%(asctime)s %(message)s',
-        level=logging.WARNING)
+        level=logging.WARNING,
+#       level=logging.NOTSET,
+        format='{}: %(message)s'.format(pathlib.Path(sys.argv[0]).name),
+    )
 
     args = parser.parse_args(args)
     remote = Remote(args.repository, args.url)
@@ -301,7 +463,7 @@ async def main(args=None):
             continue
 
         if line.startswith('list'):
-            for commitid, tagid, tag in remote.list():
+            for commitid, tagid, tag in (await remote.list()):
                 await out('{} refs/tags/{}'.format(tagid, tag))
                 await out('{} refs/tags/{}^{{}}'.format(commitid, tag))
 
@@ -312,10 +474,12 @@ async def main(args=None):
             while line:
                 _, objectid, ref = line.split()
                 logging.debug('objectid %r ref %r', objectid, ref)
-                remote.fetch(objectid, ref)
+                await remote.fetch(objectid, ref)
                 line = (await stdin.readline()).decode().strip()
 
             await out()
+
+            logging.debug('fetch ended')
             continue
 
         if line.startswith('option'):
@@ -326,12 +490,20 @@ async def main(args=None):
                 await out('ok')
                 continue
 
+            if option == 'verbosity':
+                if logging.root.level != logging.NOTSET:
+                    logging.root.setLevel(logging.ERROR - 10 * int(args))
+                await out('ok')
+                continue
+
             await out('unsupported')
             continue
 
     logging.debug('loop ended; sys.stdin.readable')
 
 if __name__ == '__main__':
-    asyncio.get_event_loop().run_until_complete(main())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
+    loop.close()
 
 # vim: ts=4 sts=4 sw=4 et
