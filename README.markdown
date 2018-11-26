@@ -23,7 +23,17 @@ git remote add <remote> qrexec://<qube>/<directory>[?keyring=<keyring>][&list_he
 - list_head_only= if true (the default) means that only the latest tag is
   listed; set to something false to list all tags
 
-After defining it, you can list it and fetch individual tags.
+After defining it, you can list it and fetch individual tags:
+
+```
+git ls-remote <remote>
+git pull [--ff-only] <remote> <tag>
+```
+
+*NOTE* that by design it is not possible to list branches and pull from them,
+because branches (their names and things they point to) are not signed. So there
+is no way to verify you're actually pulling from the branch you'd like. In
+contrast, tags are signed and the signature also covers the name of the tag.
 
 ## installation and setup
 
@@ -66,6 +76,8 @@ user@qubes-dev:qubes-src$ mkdir core-admin
 user@qubes-dev:qubes-src$ cd core-admin
 user@qubes-dev:qubes-src/core-admin$ git init
 user@qubes-dev:qubes-src/core-admin$ git remote add origin qrexec://github/qubes-core-admin?keyring=qubes-team.kbx
+user@qubes-dev:qubes-src/core-admin$ git ls-remote origin
+user@qubes-dev:qubes-src/core-admin$ git pull --ff-only origin R4.0
 ```
 
 ## hacking
