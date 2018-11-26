@@ -263,6 +263,12 @@ class Remote:
         ret = []
         untrusted_data = await self._qrexec(
             'git.ListHeadOnly' if self._list_head_only else 'git.List')
+
+        if not untrusted_data and self._list_head_only:
+            logging.warning(
+                'warning: list_head_only is on and HEAD has no signed tag')
+            return []
+
         for untrusted_line in untrusted_data.rstrip(b'\n').split(b'\n'):
             untrusted_commitid, untrusted_tagid, untrusted_tag = (
                 untrusted_line.split(b' '))
