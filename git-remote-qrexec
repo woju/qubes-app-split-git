@@ -179,7 +179,7 @@ class AbstractTagVerifier:
 
     # the following methods can be overloaded:
 
-    async def gpgv(self, *, untrusted_sig, untrusted_tag):
+    async def gpgv(self):
         raise NotImplementedError()
 
     def cleanup(self):
@@ -187,7 +187,7 @@ class AbstractTagVerifier:
 
 
 class TagVerifier(AbstractTagVerifier):
-    async def gpgv(self, *, untrusted_sig, untrusted_tag):
+    async def gpgv(self):
         sig_read, sig_write = os.pipe()
         tag_read, tag_write = os.pipe()
 
