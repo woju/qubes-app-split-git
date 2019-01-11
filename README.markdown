@@ -35,6 +35,17 @@ because branches (their names and things they point to) are not signed. So there
 is no way to verify you're actually pulling from the branch you'd like. In
 contrast, tags are signed and the signature also covers the name of the tag.
 
+For the first commit, `git pull` refuses to merge disjoint histories (after
+`git init` there is no commit in current branch). Therefore, use `git fetch` and
+`git reset --hard FETCH_HEAD`:
+
+``
+git init
+git ls-remote <remote>
+git fetch <remote> <tag>
+git reset --hard FETCH_HEAD
+```
+
 ## installation and setup
 
 1. `git-remote-qrexec` goes somewhere in the `$PATH`, maybe `$HOME/bin` or
@@ -77,7 +88,8 @@ user@qubes-dev:qubes-src$ cd core-admin
 user@qubes-dev:qubes-src/core-admin$ git init
 user@qubes-dev:qubes-src/core-admin$ git remote add origin qrexec://github/qubes-core-admin?keyring=qubes-team.kbx
 user@qubes-dev:qubes-src/core-admin$ git ls-remote origin
-user@qubes-dev:qubes-src/core-admin$ git pull --ff-only origin R4.0
+user@qubes-dev:qubes-src/core-admin$ git fetch origin R4.0
+user@qubes-dev:qubes-src/core-admin$ git reset --hard FETCH_HEAD
 ```
 
 ## hacking
