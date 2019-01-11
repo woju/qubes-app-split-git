@@ -39,7 +39,7 @@ For the first commit, `git pull` refuses to merge disjoint histories (after
 `git init` there is no commit in current branch). Therefore, use `git fetch` and
 `git reset --hard FETCH_HEAD`:
 
-``
+```
 git init
 git ls-remote <remote>
 git fetch <remote> <tag>
