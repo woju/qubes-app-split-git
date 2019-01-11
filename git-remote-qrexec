@@ -67,10 +67,14 @@ parser = argparse.ArgumentParser()
 parser.add_argument('repository')
 parser.add_argument('url')
 
+class VerificationError(Exception):
+    pass
+
 class GitObject:
     # pylint: disable=too-few-public-methods
     def __init__(self, objectid, *, untrusted_data):
-        assert objectid == hashlib.sha1(untrusted_data).hexdigest()
+        if objectid != hashlib.sha1(untrusted_data).hexdigest():
+            raise VerificationError()
         self.objectid = objectid
         self._data = untrusted_data
         del untrusted_data
@@ -80,12 +84,15 @@ class GitObject:
         untrusted_type, untrusted_size = untrusted_header.split(' ')
         del untrusted_header
 
-        assert untrusted_size.isdigit()
+        if not untrusted_size.isdigit():
+            raise VerificationError()
         untrusted_size = int(untrusted_size)
-        assert len(untrusted_content) == untrusted_size
+        if len(untrusted_content) != untrusted_size:
+            raise VerificationError()
         del untrusted_size
 
-        assert untrusted_type in ('tag', 'commit', 'tree', 'blob')
+        if untrusted_type not in ('tag', 'commit', 'tree', 'blob'):
+            raise VerificationError()
         self.type = untrusted_type
         del untrusted_type
 
@@ -129,7 +136,8 @@ class AbstractTagVerifier:
     async def verify_tag(self, untrusted_tag):
         logging.debug('verify_tag')
         untrusted_data = untrusted_tag.content
-        assert BEGIN_PGP_SIGNATURE in untrusted_data
+        if BEGIN_PGP_SIGNATURE not in untrusted_data:
+            raise VerificationError()
         index = untrusted_data.index(BEGIN_PGP_SIGNATURE)
         untrusted_signature = untrusted_data[index:]
         untrusted_tag = untrusted_data[:index]
@@ -149,7 +157,8 @@ class AbstractTagVerifier:
 
         self.cleanup()
         await proc.wait()
-        assert proc.returncode == 0
+        if proc.returncode != 0:
+            raise VerificationError()
 
         tag = untrusted_tag
         del untrusted_tag
@@ -234,8 +243,8 @@ class Remote:
         self.name = name
 
         url = urllib.parse.urlsplit(url)
-        assert url.scheme == 'qrexec'
-        assert not url.fragment
+        if url.scheme != 'qrexec' or url.fragment:
+            raise ValueError('invalid remote URI')
 
         query = {} if not url.query else urllib.parse.parse_qs(url.query,
             strict_parsing=True, errors='strict')
@@ -250,11 +259,13 @@ class Remote:
             self._list_head_only = configparser.ConfigParser.BOOLEAN_STATES[
                 list_head_only[-1].casefold()]
 
-        assert not query
+        if query:
+            raise ValueError('invalid remote URI')
 
         self.vmname = url.netloc
         self.path = url.path.lstrip('/')
-        assert '/' not in self.path
+        if '/' in self.path:
+            raise ValueError('invalid remote URI')
 
         self.git_dir = pathlib.Path(os.environ['GIT_DIR'])
         self._objects_seen = set()
@@ -276,7 +287,8 @@ class Remote:
             commitid = self._verify_objid(untrusted_objid=untrusted_commitid)
             tagid = self._verify_objid(untrusted_objid=untrusted_tagid)
 
-            assert not set(untrusted_tag) - ALLOWED_IN_TAG_NAME
+            if set(untrusted_tag) - ALLOWED_IN_TAG_NAME:
+                raise VerificationError()
             tag = untrusted_tag
             del untrusted_tag
 
@@ -286,14 +298,15 @@ class Remote:
         return ret
 
     async def fetch(self, objid, refname):
-        assert refname.startswith('refs/tags/')
+        if not refname.startswith('refs/tags/'):
+            raise VerificationError()
         tagname = refname[10:]
 
         untrusted_tag = await self._qrexec_fetch(objid)
         await self.verify_tag(untrusted_tag=untrusted_tag)
 
-        assert untrusted_tag['tag'] == tagname
-        assert untrusted_tag['type'] == 'commit'
+        if untrusted_tag['tag'] != tagname or untrusted_tag['type'] != 'commit':
+            raise VerificationError()
 
         tag = untrusted_tag
         del untrusted_tag
@@ -340,7 +353,8 @@ class Remote:
                 iden='{} input={!r}'.format(rpcfull, input)),
             timeout=TIMEOUT)
         await proc.wait()
-        assert proc.returncode == 0
+        if proc.returncode != 0:
+            raise VerificationError()
 
         return stdout
 
@@ -429,8 +443,9 @@ class Remote:
 
     @staticmethod
     def _verify_objid(untrusted_objid):
-        assert len(untrusted_objid) == 40
-        assert not set(untrusted_objid) - ALLOWED_IN_OBJECT_ID
+        if (len(untrusted_objid) != 40
+        or set(untrusted_objid) - ALLOWED_IN_OBJECT_ID):
+            raise VerificationError()
         objid = untrusted_objid
         del untrusted_objid
         return objid
